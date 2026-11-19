@@ -1,42 +1,23 @@
 # shellcheck disable=SC2148
 
 if [ -n "${BASH_VERSION:-}" ]; then
-    _dev_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+    _root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 elif [ -n "${ZSH_VERSION:-}" ]; then
-    _dev_dir="${0:a:h}"
+    _root_dir="${0:a:h}"
 else
     echo "dev.sh only supports bash and zsh" >&2
     return 1 2>/dev/null || exit 1
 fi
 
-. "${_dev_dir}/shared.sh"
-unset _dev_dir
+source "$_root_dir/devutils/shared.sh"
+source "$_root_dir/devutils/set_quilt_vars.sh"
 
-setup_environment
-
-source "$_main_repo/devutils/set_quilt_vars.sh"
-export QUILT_PATCHES="$_root_dir/patches"
-export QUILT_SERIES="$QUILT_PATCHES/series.merged"
-alias quilt='quilt --quiltrc -'
-
-___helium_setup_gn() {
-    SCCACHE_ENABLED=y write_gn_args
-    sed -i s/is_official_build/is_component_build/ "${_out_dir}/args.gn"
-}
-
-___helium_info_pull() {
-    fetch_sources "${1:-false}" false
-
-    mkdir -p "$_src_dir/out/Default"
-    cd "$_src_dir"
-}
-
-___helium_setup() {
-    local clone=false
+___helium_setup_presetup() {
+    local download=true
     if [ $# -eq 1 ] && [ "$1" = -c ]; then
-        clone=true
+        download=false
     elif [ $# -ne 0 ]; then
-        echo "usage: he setup [-c]" >&2
+        echo "usage: he setup|presetup [-c]" >&2
         return 1
     fi
 
@@ -45,32 +26,39 @@ ___helium_setup() {
         return
     fi
 
-    rm -rf "$_src_dir" && mkdir -p "$_dl_cache" "$_src_dir"
+    rm -rf "$_src_dir" && mkdir -p "$_src_dir"
 
-    ___helium_info_pull "$clone"
+    fetch_sources "$download"
+    mkdir -p "$_out_dir"
+    cd "$_src_dir"
     python3 "$_main_repo/utils/prune_binaries.py" --keep-build-dependencies "$_src_dir" "$_main_repo/pruning.list"
     helium_resources
-    ___helium_setup_gn
+    write_gn_args "$_arch" dev
 
-    ___helium_patches_op merge
+    python3 "$_main_repo/utils/helium_version.py" \
+        --tree "$_main_repo" \
+        --platform-tree "$_root_dir" \
+        --chromium-tree "$_src_dir"
+}
 
-    helium_version
+___helium_setup() {
+    ___helium_setup_presetup "$@"
+
+    "$_root_dir/devutils/update_patches.sh" merge
 
     cd "$_src_dir"
     quilt push -a --refresh
 
-    gn_gen
+    gn_gen --export-compile-commands
 }
 
 ___helium_reset() {
-    ___helium_patches_op unmerge || true
-    rm -f "$_subs_cache"
-    rm -f "$_namesubs_cache"
-
-    (
-        mv "$_src_dir" "${_src_dir}x" && \
-        rm -rf "${_src_dir}x"
-    ) &
+    "$_root_dir/devutils/update_patches.sh" unmerge || true
+    rm "$_subs_cache" || true
+    rm "$_namesubs_cache" || true
+    if mv "$_src_dir" "${_src_dir}x"; then
+        rm -rf "${_src_dir}x" &
+    fi
 }
 
 ___helium_name_substitution() {
@@ -90,6 +78,14 @@ ___helium_name_substitution() {
         echo "unknown action: $1" >&2
         return
     fi
+}
+
+___helium_apply_translations() {
+    python3 "$_main_repo/utils/i18n_apply.py" -t "$_src_dir"
+}
+
+___helium_generate_translations() {
+    python3 "$_main_repo/devutils/i18n.py" generate
 }
 
 ___helium_substitution() {
@@ -119,7 +115,12 @@ ___helium_substitution() {
 }
 
 ___helium_build() {
-    build -k 0
+    local -a siso_flags=(${=SISO_FLAGS:-})
+    cd "$_src_dir"
+    if [ -n "${SISO_REAPI_ADDRESS:-}" ]; then
+        configure_siso || return
+    fi
+    helium_build -k 0 "${siso_flags[@]}" "$@"
 }
 
 ___helium_run() {
@@ -131,7 +132,8 @@ ___helium_run() {
 
     cd "$_src_dir" && ./out/Default/helium \
     --user-data-dir="$profile" \
-    --enable-ui-devtools=$RANDOM "$@"
+    --enable-ui-devtools=$RANDOM \
+    "$@"
 }
 
 ___helium_wt_path() {
@@ -216,13 +218,14 @@ ___helium_wt() {
 }
 
 ___helium_pull() {
+
     if [ -f "$_subs_cache" ]; then
         echo "source files are substituted, please run 'he unsub' first" >&2
         return 1
     fi
 
     cd "$_src_dir" && quilt pop -a || true
-    ___helium_patches_op unmerge || true
+    "$_root_dir/devutils/update_patches.sh" unmerge || true
 
     for dir in "$_root_dir" "$_main_repo"; do
         git -C "$dir" stash \
@@ -232,14 +235,16 @@ ___helium_pull() {
         || true
     done
 
-    ___helium_patches_op merge
+    "$_root_dir/devutils/update_patches.sh" merge
     cd "$_src_dir" && quilt push -a --refresh
 }
 
-___helium_patches_op() {
-    python3 "$_main_repo/devutils/update_platform_patches.py" \
-        "$1" \
-        "$_root_dir/patches"
+___helium_patches_merge() {
+    "$_root_dir/devutils/update_patches.sh" merge
+}
+
+___helium_patches_unmerge() {
+    "$_root_dir/devutils/update_patches.sh" unmerge
 }
 
 ___helium_quilt_push() {
@@ -250,49 +255,148 @@ ___helium_quilt_pop() {
     cd "$_src_dir" && quilt pop -a
 }
 
-__helium_menu() {
+___helium_validate() {
+    if [ "$1" = "config" ]; then
+        python3 "$_main_repo/devutils/validate_config.py"
+    elif [ "$1" = "patches" ]; then
+        if [ ! -f "patches/series.merged" ]; then
+            echo "patches/series.merged doesn't exist. did you forget to merge?" >&2
+            return 1
+        fi
+        python3 "$_main_repo/devutils/validate_patches.py" \
+            -l "$_src_dir" \
+            -s patches/series.merged
+    elif [ "$1" = "series" ]; then
+        "$_root_dir/devutils/check_patch_files.sh"
+    else
+        echo "unknown validate action. usage: he validate <config|patches|series>" >&2
+    fi
+}
+
+___helium_format() {
+    cd "$_src_dir"
+    quilt diff | "$_src_dir/third_party/clang-format/script/clang-format-diff.py" \
+    -p1 -i -style=file
+}
+
+___helium_find_tidy_diff() {
+    if [ -n "$_tidy_diff_script" ]; then
+        return
+    elif command -v clang-tidy-diff >/dev/null 2>&1; then
+        _tidy_diff_script=$(command -v clang-tidy-diff)
+    elif command -v clang-tidy-diff.py >/dev/null 2>&1; then
+        _tidy_diff_script=$(command -v clang-tidy-diff.py)
+    else
+        _tidy_diff_script=$(find /opt/homebrew/Cellar/llvm -name clang-tidy-diff.py | head -1)
+    fi
+
+    if [ -z "$_tidy_diff_script" ]; then
+        echo "could not find clang-tidy-diff.py script." >&2
+        echo "ensure that you have llvm installed on your system" >&2
+        return 1
+    fi
+}
+
+___helium_strip_compile_commands() {
+    _ccmd_path="$_out_dir/compile_commands.json"
+    [ "$_ccmd_stripped" = 1 ] && return;
+    _ccmd_stripped=1
+
+    echo "normalizing compile_commands.json, this will take a while..."
+    cp "$_ccmd_path" "$_ccmd_path.orig";
+    gsed -Ei 's/^(\s*"command": ").*?\s(\S+bin\/clang)/\1\2/g' "$_ccmd_path"
+}
+
+___helium_tidy() {
+    ___helium_find_tidy_diff || return;
+    ___helium_strip_compile_commands;
+    quilt diff | "$_tidy_diff_script" \
+        -regex '.*\.(cc|mm)' \
+        -use-color \
+        -p1 \
+        -path "$_out_dir" \
+        -quiet \
+        -j$(nproc)
+}
+
+___helium_lint() {
+    ___helium_format;
+    ___helium_tidy;
+}
+
+___helium_menu() {
     set -e
     case $1 in
         setup) shift; ___helium_setup "$@";;
-        build) ___helium_build;;
-        run) shift; ___helium_run "$@";;
-        pull) ___helium_pull;;
+        presetup) shift; ___helium_setup_presetup "$@";;
+        configure) gn_gen --export-compile-commands;;
+        resources) helium_resources;;
+
         sub|unsub) ___helium_substitution "$1";;
         namesub|nameunsub) ___helium_name_substitution "$1";;
-        merge) ___helium_patches_op merge;;
-        unmerge) ___helium_patches_op unmerge;;
+        translate) ___helium_apply_translations;;
+        transgen) ___helium_generate_translations;;
+
+        merge) ___helium_patches_merge;;
+        unmerge) ___helium_patches_unmerge;;
         push) ___helium_quilt_push;;
         pop) ___helium_quilt_pop;;
-        resources) helium_resources;;
+        pull) ___helium_pull;;
+
+        validate) ___helium_validate "$2";;
+        format) ___helium_format;;
+        tidy) ___helium_tidy;;
+        lint) ___helium_lint;;
+
+        build) shift; ___helium_build "$@";;
+        run) shift; ___helium_run "$@";;
         reset) ___helium_reset;;
-        translate) helium_apply_translations;;
         wt) shift; ___helium_wt "$@";;
         *)
-            printf 'usage: he (setup | build | run | sub | unsub | namesub | nameunsub | merge | unmerge | push | pop | pull | reset | translate | wt)\n' >&2
-            printf '\tsetup [-c] - sets up the dev environment, optionally cloning chromium\n' >&2
-            printf '\tbuild - prepares a development build binary\n' >&2
-            printf '\trun [args] - runs a development build of helium with dev data dir & ui devtools enabled\n' >&2
+            printf 'usage: he <command>\n' >&2
+            printf '\tsetup [-c] - sets up the dev environment, optionally cloning Chromium\n' >&2
+            printf '\t         equivalent of: [presetup, merge, push, configure]\n' >&2
+            printf '\tpresetup [-c] - prepares sources and dependencies, optionally cloning Chromium\n' >&2
+            printf '\tconfigure - generates build configuration and tools\n' >&2
+            printf '\tresources - generates and copies helium resources (such as icons)\n' >&2
+
+            printf '\n\n' >&2
             printf '\tsub - apply google domain and name substitutions\n' >&2
-            printf '\tunsub - undo google domain substitutions\n' >&2
+            printf '\tunsub - undo google domain and name substitutions\n' >&2
             printf '\tnamesub - apply only name substitutions\n' >&2
-            printf '\tnameunsub - undo name substitutions\n' >&2
+            printf '\tnameunsub - undo only name substitutions\n' >&2
+            printf '\ttranslate - apply translations from i18n directory\n' >&2
+            printf '\ttransgen - generate source strings for translation\n' >&2
+
+            printf '\n\n' >&2
             printf '\tmerge - merges all patches\n' >&2
             printf '\tunmerge - unmerges all patches\n' >&2
             printf '\tpush - applies all patches\n' >&2
             printf '\tpop - undoes all patches\n' >&2
-            printf '\tresources - copies helium resources (such as icons)\n' >&2
-            printf '\tpull - undoes all patches, pulls, redoes all patches\n' >&2
+            printf '\tpull - undoes all patches, pulls from git, redoes all patches\n' >&2
+
+            printf '\n\n' >&2
+            printf '\tvalidate config - validates the build configuration\n' >&2
+            printf '\tvalidate patches - validates that patches are applied correctly\n' >&2
+            printf '\tvalidate series - checks the consistency of the series file\n' >&2
+            printf '\tformat - formats the topmost patch according to Chromium coding style\n' >&2
+            printf '\ttidy - runs clang-tidy on the topmost patch\n' >&2
+            printf '\tlint - he format + he tidy\n' >&2
+
+            printf '\n\n' >&2
+            printf '\tbuild - builds a development binary\n' >&2
+            printf '\trun [args] - runs a development build of helium with dev data dir & ui devtools enabled\n' >&2
             printf '\treset - nukes everything\n' >&2
-            printf '\ttranslate - apply translations from i18n folder\n' >&2
-            printf '\twt new [--copy] <name> - creates a worktree with a reflink copy of the current source tree,\n' >&2
-            printf '\t\tor a full copy with --copy if the filesystem lacks reflinks\n' >&2
+
+            printf '\n\n' >&2
+            printf '\twt new <name> - creates a worktree with an APFS clone of the current source tree\n' >&2
             printf '\twt rm <name> - removes a worktree and its source tree, keeping its branches\n' >&2
             printf '\twt ls - lists worktrees\n' >&2
     esac
 }
 
 he() {
-    (__helium_menu "$@")
+    (___helium_menu "$@")
 }
 
 if ! (return 0 2>/dev/null); then
